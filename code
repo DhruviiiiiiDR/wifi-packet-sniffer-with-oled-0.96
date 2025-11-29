@@ -1,0 +1,438 @@
+/* ESP32 WiFi Sniffer + 0.96" SSD1306 OLED (128x64)
+   
+   Wiring (I2C):
+   VCC  ->  3.3V
+   GND  ->  GND
+   SCL  ->  GPIO 22 (default I2C clock)
+   SDA  ->  GPIO 21 (default I2C data)
+   
+   Features:
+   - Sniffs WiFi beacons and probe requests
+   - Channel hopping (1-13)
+   - Real-time display of MAC addresses
+   - RSSI signal strength
+   - Packet counters
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+extern "C"
+{
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+}
+
+// ----- OLED Configuration -----
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ----- Data structures -----
+struct SniffItem
+{
+    uint8_t type; // 0x80 beacon, 0x40 probe req
+    int8_t rssi;
+    uint8_t mac[6];
+    uint8_t channel;
+    uint32_t ts;
+};
+
+static QueueHandle_t sniffQueue = NULL;
+
+// LRU seen cache
+#define CACHE_SIZE 64
+struct Seen
+{
+    uint8_t mac[6];
+    uint8_t type;
+    uint32_t last_ts;
+} seenCache[CACHE_SIZE];
+
+// Rolling display buffer - optimized for 0.96" OLED
+#define LINES_ON_SCREEN 5  // Fits nicely on 64px height
+SniffItem displayBuffer[LINES_ON_SCREEN];
+
+// Global channel tracking
+volatile uint8_t currentChannel = 1;
+
+// Stats counters
+uint32_t beaconCount = 0;
+uint32_t probeCount = 0;
+
+// ----- Helper functions -----
+static inline bool macEqual(const uint8_t *a, const uint8_t *b)
+{
+    for (int i = 0; i < 6; i++)
+        if (a[i] != b[i])
+            return false;
+    return true;
+}
+
+bool seen_check_and_update(const uint8_t *mac, uint8_t type, uint32_t now_ms, uint32_t min_age_ms = 5000)
+{
+    for (int i = 0; i < CACHE_SIZE; i++)
+    {
+        if (macEqual(seenCache[i].mac, mac) && seenCache[i].type == type)
+        {
+            if (now_ms - seenCache[i].last_ts < min_age_ms)
+                return false;
+            seenCache[i].last_ts = now_ms;
+            return true;
+        }
+    }
+    for (int i = 0; i < CACHE_SIZE; i++)
+    {
+        bool empty = true;
+        for (int j = 0; j < 6; j++)
+            if (seenCache[i].mac[j] != 0)
+            {
+                empty = false;
+                break;
+            }
+        if (empty)
+        {
+            memcpy(seenCache[i].mac, mac, 6);
+            seenCache[i].type = type;
+            seenCache[i].last_ts = now_ms;
+            return true;
+        }
+    }
+    int oldest = 0;
+    uint32_t ot = seenCache[0].last_ts;
+    for (int i = 1; i < CACHE_SIZE; i++)
+        if (seenCache[i].last_ts < ot)
+        {
+            ot = seenCache[i].last_ts;
+            oldest = i;
+        }
+    memcpy(seenCache[oldest].mac, mac, 6);
+    seenCache[oldest].type = type;
+    seenCache[oldest].last_ts = now_ms;
+    return true;
+}
+
+// ----- Promiscuous callback -----
+IRAM_ATTR void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (type != WIFI_PKT_MGMT)
+        return;
+    wifi_promiscuous_pkt_t *p = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *payload = p->payload;
+    if (!payload)
+        return;
+
+    uint8_t fc0 = payload[0];
+    if (fc0 != 0x80 && fc0 != 0x40)
+        return;
+
+    SniffItem item;
+    item.type = fc0;
+    item.rssi = p->rx_ctrl.rssi;
+    item.channel = (uint8_t)currentChannel;
+    memcpy(item.mac, payload + 10, 6);
+    item.ts = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    xQueueSendFromISR(sniffQueue, &item, NULL);
+}
+
+// ----- MAC to compact string -----
+void macToCompactStr(const uint8_t *mac, char *out)
+{
+    // Show last 3 octets to save space
+    sprintf(out, "%02X:%02X:%02X",
+            mac[3], mac[4], mac[5]);
+}
+
+// ----- Boot animation for OLED -----
+void bootAnimation()
+{
+    display.clearDisplay();
+    
+    // Matrix-style falling characters effect
+    for (int frame = 0; frame < 30; frame++)
+    {
+        display.clearDisplay();
+        
+        // Random characters falling
+        for (int i = 0; i < 10; i++)
+        {
+            int x = random(0, SCREEN_WIDTH - 6);
+            int y = random(0, SCREEN_HEIGHT - 8);
+            display.setCursor(x, y);
+            display.setTextColor(SSD1306_WHITE);
+            display.write(random(33, 126));
+        }
+        
+        display.display();
+        delay(50);
+    }
+    
+    display.clearDisplay();
+    delay(100);
+    
+    // WATCHDOG title with glitch effect
+    display.setTextSize(2);
+    
+    for (int i = 0; i < 3; i++)
+    {
+        display.clearDisplay();
+        display.setCursor(10, 10);
+        display.print("WATCHDOG");
+        display.display();
+        delay(80);
+        display.clearDisplay();
+        display.display();
+        delay(40);
+    }
+    
+    display.clearDisplay();
+    display.setCursor(10, 10);
+    display.print("WATCHDOG");
+    
+    // Version
+    display.setTextSize(1);
+    display.setCursor(108, 12);
+    display.print("V1");
+    
+    // Subtitle
+    display.setCursor(8, 30);
+    display.print("WiFi Sniffer");
+    display.display();
+    delay(800);
+    
+    // Boot sequence
+    display.clearDisplay();
+    display.setTextSize(1);
+    
+    const char *bootMsgs[] = {
+        "> Init ESP32...",
+        "> WiFi OK",
+        "> Promisc ON",
+        "> Ready"
+    };
+    
+    int y = 5;
+    for (int i = 0; i < 4; i++)
+    {
+        display.setCursor(2, y);
+        display.print(bootMsgs[i]);
+        display.display();
+        y += 12;
+        delay(200);
+    }
+    
+    delay(500);
+    display.clearDisplay();
+    display.display();
+}
+
+// ----- Draw status header -----
+void drawHeader(uint8_t channel)
+{
+    display.fillRect(0, 0, SCREEN_WIDTH, 10, SSD1306_BLACK);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    
+    char buf[32];
+    snprintf(buf, sizeof(buf), "CH:%2d B:%d P:%d", 
+             channel, beaconCount, probeCount);
+    display.print(buf);
+}
+
+// ----- Draw packet line -----
+void drawPacketLine(uint8_t lineIdx, const SniffItem &it)
+{
+    if (lineIdx >= LINES_ON_SCREEN)
+        return;
+    
+    // Calculate Y position (header is 10px, each line is 10px)
+    const int y = 12 + lineIdx * 10;
+    
+    // Clear line
+    display.fillRect(0, y, SCREEN_WIDTH, 10, SSD1306_BLACK);
+    
+    if (it.ts == 0) // Empty slot
+        return;
+    
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, y);
+    
+    // Format: "B xx:xx:xx -65 c12"
+    char macs[12];
+    macToCompactStr(it.mac, macs);
+    
+    char typeChar = (it.type == 0x80) ? 'B' : 'P';
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%c %s %ddB c%d", 
+             typeChar, macs, it.rssi, it.channel);
+    display.print(buf);
+}
+
+// ----- Set channel helper -----
+void setSnifferChannel(uint8_t ch)
+{
+    if (ch < 1)
+        ch = 1;
+    if (ch > 13)
+        ch = 13;
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    currentChannel = ch;
+}
+
+// ----- Setup -----
+void setup()
+{
+    Serial.begin(115200);
+    delay(100);
+    
+    Serial.println("ESP32 WiFi Sniffer - 0.96\" OLED");
+
+    memset(seenCache, 0, sizeof(seenCache));
+    memset(displayBuffer, 0, sizeof(displayBuffer));
+
+    // Initialize OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        while(1) delay(1000);
+    }
+    
+    display.clearDisplay();
+    display.display();
+    Serial.println("Display initialized");
+
+    // Show boot animation
+    bootAnimation();
+
+    // Create packet queue
+    sniffQueue = xQueueCreate(64, sizeof(SniffItem));
+    if (!sniffQueue)
+    {
+        Serial.println("Queue fail");
+        display.clearDisplay();
+        display.setCursor(10, 28);
+        display.setTextSize(1);
+        display.print("QUEUE FAIL!");
+        display.display();
+        while (1)
+            delay(1000);
+    }
+
+    // WiFi init
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_wifi_start();
+
+    // Promiscuous filter
+    wifi_promiscuous_filter_t filt;
+    filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filt);
+
+    // Enable sniffer
+    esp_wifi_set_promiscuous_rx_cb(&wifi_sniff_cb);
+    esp_wifi_set_promiscuous(true);
+
+    // Start on channel 1
+    setSnifferChannel(1);
+
+    Serial.println("Sniffer started");
+    
+    // Initial display
+    display.clearDisplay();
+    drawHeader(1);
+    display.display();
+}
+
+// ----- Main Loop -----
+uint8_t hopChannel = 1;
+unsigned long lastHop = 0;
+const unsigned long HOP_MS = 250; // Slower hop for better packet capture
+
+void loop()
+{
+    // Channel hopping
+    unsigned long now = millis();
+    if (now - lastHop >= HOP_MS)
+    {
+        hopChannel++;
+        if (hopChannel > 13)
+            hopChannel = 1;
+        setSnifferChannel(hopChannel);
+        lastHop = now;
+        
+        // Update header
+        drawHeader(hopChannel);
+    }
+
+    // Process queued packets
+    SniffItem it;
+    bool updated = false;
+    
+    while (xQueueReceive(sniffQueue, &it, 0) == pdTRUE)
+    {
+        // Dedupe
+        if (!seen_check_and_update(it.mac, it.type, it.ts, 5000))
+        {
+            continue;
+        }
+        
+        // Update counters
+        if (it.type == 0x80)
+            beaconCount++;
+        else
+            probeCount++;
+        
+        // Push into rolling buffer
+        for (int i = LINES_ON_SCREEN - 1; i > 0; --i)
+            displayBuffer[i] = displayBuffer[i - 1];
+        displayBuffer[0] = it;
+        
+        updated = true;
+    }
+    
+    // Refresh display if new packets
+    if (updated)
+    {
+        display.clearDisplay();
+        drawHeader(hopChannel);
+        
+        for (uint8_t i = 0; i < LINES_ON_SCREEN; i++)
+        {
+            drawPacketLine(i, displayBuffer[i]);
+        }
+        
+        display.display();
+    }
+
+    delay(10);
+}
+
+/*
+ * TROUBLESHOOTING:
+ * 
+ * 1. If display doesn't initialize:
+ *    - Check I2C address (try 0x3D if 0x3C fails)
+ *    - Verify SDA/SCL connections (GPIO 21/22)
+ *    - Check power supply
+ * 
+ * 2. If no WiFi packets:
+ *    - Ensure you're in an area with WiFi devices
+ *    - Check Serial Monitor for debug messages
+ *    - Verify ESP32 WiFi is working
+ * 
+ * 3. Display format:
+ *    - B = Beacon frame (from access points)
+ *    - P = Probe request (from devices searching)
+ *    - Last 3 octets of MAC shown to save space
+ *    - RSSI in dBm (signal strength)
+ *    - Channel number where packet was captured
+ */
